@@ -82,4 +82,32 @@ UTOPIA_DB_URL=postgresql://...  UTOPIA_TOKEN=...  node dist/index.js
 
 ## 部署
 
-见 `deploy/docker-compose.yml`。生产部署复用 `/opt/utopia/.env`，容器加入 `utopia_default` 网络，仅监听 `127.0.0.1:18425`，对外由 Caddy 提供 TLS 反代。
+见 `deploy/docker-compose.yml`。生产部署复用 `/opt/utopia/.env`，容器加入 `utopia_default` 网络，仅监听 `127.0.0.1:18426`，对外由 Caddy 提供 TLS 反代。
+
+### 上线拓扑
+
+```
+Codex / 客户端
+   │  https://sleepnow.top:18425/mcp  (Authorization: Bearer $UTOPIA_TOKEN)
+   ▼
+frps (公网 VPS)  ──frpc──▶  服务器 127.0.0.1:18425 (Caddy, TLS)
+                                    │
+                                    ▼
+                            127.0.0.1:18426 (utopia-mcp)
+                                    │
+                                    ▼
+                            utopia-postgres:5432
+```
+
+- 鉴权由 `utopia-mcp` 自身完成（Bearer token）；Caddy 只做 TLS 终结与转发，不复制凭据。
+- `GET /health` 免鉴权，供网关与容器探活。
+
+### Codex 接入
+
+```bash
+codex mcp add utopia \
+  --url "https://sleepnow.top:18425/mcp" \
+  --bearer-token-env-var UTOPIA_TOKEN
+```
+
+令牌只需存在于用户级环境变量（不要写进 `config.toml`）。
