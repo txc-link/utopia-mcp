@@ -3,12 +3,14 @@ import { z } from 'zod';
 import {
   entityGet,
   entitySearch,
+  entityUpsert,
   evidenceGet,
   statementPropose,
   statementQuery,
   statementReview,
   typeGet,
   typeList,
+  typeUpsert,
   vocabulary,
 } from './tools.js';
 import {
@@ -68,6 +70,59 @@ export function createServer(): McpServer {
       },
     },
     async (args) => jsonResult(await entitySearch(args)),
+  );
+
+  server.registerTool(
+    'ontology_entity_upsert',
+    {
+      title: '创建或更新实体',
+      description:
+        '创建实体实例，或按字段合并更新已有实体。' +
+        '这是 statement_propose 的前置：事实必须挂在已存在的实体上。',
+      inputSchema: {
+        entity_id: z.string(),
+        type_id: z.string(),
+        label: z.string(),
+        sensitivity: z.enum(SENSITIVITIES).optional(),
+        properties: z.record(z.unknown()).optional(),
+      },
+    },
+    async (args) => {
+      const r = await entityUpsert(args);
+      return r.ok ? jsonResult(r) : errorResult(String((r as { error?: string }).error ?? 'upsert failed'));
+    },
+  );
+
+  server.registerTool(
+    'ontology_type_upsert',
+    {
+      title: '创建或更新本体类型（高权限）',
+      description:
+        '扩展元模型：创建/更新类型及其属性定义。这是「Schema 只存在于 Utopia」的写入入口，' +
+        '属于强约束变更，调用方应同步更新 ADR。',
+      inputSchema: {
+        type_id: z.string(),
+        name: z.string(),
+        description: z.string().optional(),
+        parent_type_id: z.string().optional(),
+        schema_json: z.record(z.unknown()).optional(),
+        properties: z
+          .array(
+            z.object({
+              property_id: z.string(),
+              name: z.string(),
+              value_type: z.enum(['string', 'number', 'boolean', 'date', 'ref']),
+              cardinality: z.enum(['1', '0..1', '1..*', '0..*']).optional(),
+              constraints: z.record(z.unknown()).optional(),
+            }),
+          )
+          .optional(),
+      },
+    },
+    async (args) => {
+      const r = await typeUpsert(args);
+      return r.ok ? jsonResult(r) : errorResult(String((r as { error?: string }).error ?? 'upsert failed'));
+    },
   );
 
   server.registerTool(

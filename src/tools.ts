@@ -176,6 +176,129 @@ export async function evidenceGet(input: { statement_id?: string; evidence_id?: 
 
 // ── 写：提交 candidate（Agent 入口，§2.6 权限原则）────────────────────────
 
+/**
+ * 创建或更新实体实例。
+ *
+ * 为什么需要它：`ontology_statement_propose` 只能对**已存在**的实体断言事实。
+ * 若没有实体创建入口，Agent 就必须绕过 MCP 直接写库，破坏「所有写入都经过
+ * 校验与审计」的边界。
+ *
+ * 更新采用「字段级合并」：只覆盖显式传入的字段，未传字段保持原值；
+ * 实体本身不是双时态对象（事实才是），因此允许就地更新，但会记录 updated_at。
+ */
+export async function entityUpsert(input: {
+  entity_id: string;
+  type_id: string;
+  label: string;
+  sensitivity?: Sensitivity;
+  properties?: Record<string, unknown>;
+}) {
+  if (!input.entity_id?.trim() || !input.type_id?.trim() || !input.label?.trim()) {
+    return { ok: false, error: 'entity_id / type_id / label 均为必填' };
+  }
+  try {
+    const r = await db.query(
+      `insert into ont_entity (entity_id, type_id, label, sensitivity, properties)
+       values ($1,$2,$3,$4,$5::jsonb)
+       on conflict (entity_id) do update set
+         type_id     = excluded.type_id,
+         label       = excluded.label,
+         sensitivity = excluded.sensitivity,
+         properties  = ont_entity.properties || excluded.properties
+       returning entity_id, type_id, label, sensitivity, properties, created_at,
+                 (xmax <> 0) as was_update`,
+      [
+        input.entity_id.trim(),
+        input.type_id.trim(),
+        input.label.trim(),
+        input.sensitivity ?? 'team',
+        JSON.stringify(input.properties ?? {}),
+      ],
+    );
+    return { ok: true, entity: r.rows[0] };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes('ont_entity_type_id_fkey')) {
+      return { ok: false, error: `类型不存在: ${input.type_id}（先用 ontology_type_upsert 创建）` };
+    }
+    return { ok: false, error: msg };
+  }
+}
+
+/**
+ * 创建或更新本体类型（元模型，高权限）。
+ *
+ * 这是「Schema 只存在于 Utopia」的写入入口。与事实不同，元模型变更不是
+ * 双时态对象，但属于强约束变更，调用方应在 ADR 中留痕。
+ */
+export async function typeUpsert(input: {
+  type_id: string;
+  name: string;
+  description?: string;
+  parent_type_id?: string;
+  schema_json?: Record<string, unknown>;
+  properties?: Array<{
+    property_id: string;
+    name: string;
+    value_type: 'string' | 'number' | 'boolean' | 'date' | 'ref';
+    cardinality?: '1' | '0..1' | '1..*' | '0..*';
+    constraints?: Record<string, unknown>;
+  }>;
+}) {
+  if (!input.type_id?.trim() || !input.name?.trim()) {
+    return { ok: false, error: 'type_id / name 均为必填' };
+  }
+  const client = await (await import('./db.js')).pool.connect();
+  try {
+    await client.query('begin');
+    const t = await client.query(
+      `insert into ont_type (type_id, name, description, parent_type_id, schema_json)
+       values ($1,$2,$3,$4,$5::jsonb)
+       on conflict (type_id) do update set
+         name           = excluded.name,
+         description    = coalesce(excluded.description, ont_type.description),
+         parent_type_id = excluded.parent_type_id,
+         schema_json    = ont_type.schema_json || excluded.schema_json
+       returning *`,
+      [
+        input.type_id.trim(),
+        input.name.trim(),
+        input.description ?? null,
+        input.parent_type_id ?? null,
+        JSON.stringify(input.schema_json ?? {}),
+      ],
+    );
+    const props: string[] = [];
+    for (const p of input.properties ?? []) {
+      await client.query(
+        `insert into ont_property (property_id, type_id, name, value_type, cardinality, constraints)
+         values ($1,$2,$3,$4,$5,$6::jsonb)
+         on conflict (property_id) do update set
+           name        = excluded.name,
+           value_type  = excluded.value_type,
+           cardinality = excluded.cardinality,
+           constraints = excluded.constraints`,
+        [
+          p.property_id,
+          input.type_id.trim(),
+          p.name,
+          p.value_type,
+          p.cardinality ?? '1',
+          JSON.stringify(p.constraints ?? {}),
+        ],
+      );
+      props.push(p.property_id);
+    }
+    await client.query('commit');
+    return { ok: true, type: t.rows[0], properties_upserted: props };
+  } catch (e) {
+    await client.query('rollback');
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  } finally {
+    client.release();
+  }
+}
+
 export async function statementPropose(input: {
   subject_id: string;
   predicate: string;
