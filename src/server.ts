@@ -10,6 +10,7 @@ import {
   statementReview,
   typeGet,
   typeList,
+  typeReview,
   typeUpsert,
   vocabulary,
 } from './tools.js';
@@ -105,6 +106,7 @@ export function createServer(): McpServer {
         name: z.string(),
         description: z.string().optional(),
         parent_type_id: z.string().optional(),
+        proposed_by: z.string(),
         schema_json: z.record(z.unknown()).optional(),
         properties: z
           .array(
@@ -122,6 +124,27 @@ export function createServer(): McpServer {
     async (args) => {
       const r = await typeUpsert(args);
       return r.ok ? jsonResult(r) : errorResult(String((r as { error?: string }).error ?? 'upsert failed'));
+    },
+  );
+
+  server.registerTool(
+    'ontology_type_review',
+    {
+      title: '审批类型（高权限）',
+      description:
+        '推进本体类型的状态。合法流转：candidate→under_review|rejected|deprecated；' +
+        'under_review→approved|rejected|candidate；approved→deprecated|candidate；rejected→candidate。' +
+        '只有 approved 类型才能被实体引用。与 statement_review 同构：Agent 可提候选，批准需人工或高权限。',
+      inputSchema: {
+        type_id: z.string(),
+        to_status: z.enum(STATEMENT_STATUSES),
+        actor: z.string(),
+        note: z.string().optional(),
+      },
+    },
+    async (args) => {
+      const r = await typeReview(args);
+      return r.ok ? jsonResult(r) : errorResult(String((r as { error?: string }).error ?? 'review failed'));
     },
   );
 

@@ -237,6 +237,7 @@ export async function typeUpsert(input: {
   description?: string;
   parent_type_id?: string;
   schema_json?: Record<string, unknown>;
+  proposed_by: string;
   properties?: Array<{
     property_id: string;
     name: string;
@@ -251,21 +252,48 @@ export async function typeUpsert(input: {
   const client = await (await import('./db.js')).pool.connect();
   try {
     await client.query('begin');
+    const tid = input.type_id.trim();
+
+    // 先取现状，用于判断「内容是否真的变了」——幂等重放不应把已批准类型打回候选
+    const cur = await client.query(`select * from ont_type where type_id = $1`, [tid]);
+    const existing = cur.rows[0] as
+      | { status: string; name: string; description: string | null; parent_type_id: string | null }
+      | undefined;
+    const changed =
+      !existing ||
+      existing.name !== input.name.trim() ||
+      (input.description !== undefined && existing.description !== input.description) ||
+      (existing.parent_type_id ?? null) !== (input.parent_type_id ?? null);
+
+    // 新类型 = candidate；已批准类型若内容有变 = 退回 candidate 重新审批；
+    // 内容未变 = 保持原状态（幂等）；deprecated 不可复活。
+    const nextStatus = !existing
+      ? 'candidate'
+      : existing.status === 'deprecated'
+        ? 'deprecated'
+        : existing.status === 'approved' && (changed || (input.properties?.length ?? 0) > 0)
+          ? 'candidate'
+          : existing.status;
+
     const t = await client.query(
-      `insert into ont_type (type_id, name, description, parent_type_id, schema_json)
-       values ($1,$2,$3,$4,$5::jsonb)
+      `insert into ont_type (type_id, name, description, parent_type_id, schema_json, status, proposed_by)
+       values ($1,$2,$3,$4,$5::jsonb,'candidate',$6)
        on conflict (type_id) do update set
          name           = excluded.name,
          description    = coalesce(excluded.description, ont_type.description),
          parent_type_id = excluded.parent_type_id,
-         schema_json    = ont_type.schema_json || excluded.schema_json
+         schema_json    = ont_type.schema_json || excluded.schema_json,
+         status         = $7,
+         proposed_by    = excluded.proposed_by
        returning *`,
       [
-        input.type_id.trim(),
+        tid,
         input.name.trim(),
         input.description ?? null,
         input.parent_type_id ?? null,
         JSON.stringify(input.schema_json ?? {}),
+        input.proposed_by,
+        nextStatus,
       ],
     );
     const props: string[] = [];
@@ -280,7 +308,7 @@ export async function typeUpsert(input: {
            constraints = excluded.constraints`,
         [
           p.property_id,
-          input.type_id.trim(),
+          tid,
           p.name,
           p.value_type,
           p.cardinality ?? '1',
@@ -290,12 +318,53 @@ export async function typeUpsert(input: {
       props.push(p.property_id);
     }
     await client.query('commit');
-    return { ok: true, type: t.rows[0], properties_upserted: props };
+    const row = t.rows[0] as { status: string };
+    return {
+      ok: true,
+      type: row,
+      properties_upserted: props,
+      requires_review: row.status !== 'approved',
+      note:
+        row.status === 'approved'
+          ? undefined
+          : `类型处于 ${row.status}，实体在被引用前需经 ontology_type_review 审批为 approved`,
+    };
   } catch (e) {
     await client.query('rollback');
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   } finally {
     client.release();
+  }
+}
+
+/**
+ * 类型审批流转（高权限）。
+ * 与 statement_review 同构：Agent 可提候选，但批准需人工或高权限调用方。
+ */
+export async function typeReview(input: {
+  type_id: string;
+  to_status: StatementStatus;
+  actor: string;
+  note?: string;
+}) {
+  if (!STATEMENT_STATUSES.includes(input.to_status)) {
+    return { ok: false, error: `非法状态: ${input.to_status}` };
+  }
+  try {
+    const r = await db.query(`select * from ont_type_transition($1,$2,$3,$4)`, [
+      input.type_id,
+      input.to_status,
+      input.actor,
+      input.note ?? null,
+    ]);
+    const log = await db.query(
+      `select from_status, to_status, actor, note, at
+         from ont_type_review_log where type_id = $1 order by log_id desc limit 1`,
+      [input.type_id],
+    );
+    return { ok: true, type: r.rows[0], audit: log.rows[0] };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
