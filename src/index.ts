@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer } from './server.js';
@@ -35,20 +36,33 @@ app.use((req: Request, res: Response, next) => {
 });
 
 /**
- * MCP Streamable HTTP 端点。
- * 采用无状态模式（每次请求新建 server+transport），便于水平扩展与重启。
+ * MCP Streamable HTTP 端点（有状态会话）。
+ *
+ * 注意：不要用无状态模式（sessionIdGenerator: undefined + 每请求新建 server）。
+ * 客户端（如 Codex）会在 initialize 之后复用同一个会话做 tools/list 与 tools/call；
+ * 无状态模式下每个请求都落到新实例，客户端后续调用会报 "unsupported call"。
  */
-app.post('/mcp', async (req: Request, res: Response) => {
-  const server = createServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+const transports = new Map<string, StreamableHTTPServerTransport>();
 
-  res.on('close', () => {
-    void transport.close();
-    void server.close();
-  });
+app.post('/mcp', async (req: Request, res: Response) => {
+  const sessionId = req.header('mcp-session-id');
+  let transport = sessionId ? transports.get(sessionId) : undefined;
+
+  if (!transport) {
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sid) => {
+        transports.set(sid, transport as StreamableHTTPServerTransport);
+      },
+    });
+    transport.onclose = () => {
+      const sid = transport?.sessionId;
+      if (sid) transports.delete(sid);
+    };
+    await createServer().connect(transport);
+  }
 
   try {
-    await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
     console.error('utopia-mcp: handleRequest failed', err);
@@ -60,6 +74,28 @@ app.post('/mcp', async (req: Request, res: Response) => {
       });
     }
   }
+});
+
+/** 会话终止（客户端主动关闭）。 */
+app.delete('/mcp', async (req: Request, res: Response) => {
+  const sid = req.header('mcp-session-id');
+  const transport = sid ? transports.get(sid) : undefined;
+  if (transport) {
+    await transport.close();
+    if (sid) transports.delete(sid);
+  }
+  res.status(204).end();
+});
+
+/** SSE 流（服务端主动推送到已有会话）。 */
+app.get('/mcp', async (req: Request, res: Response) => {
+  const sid = req.header('mcp-session-id');
+  const transport = sid ? transports.get(sid) : undefined;
+  if (!transport) {
+    res.status(400).type('text/plain').send('Invalid or missing session');
+    return;
+  }
+  await transport.handleRequest(req, res);
 });
 
 const httpServer = app.listen(PORT, () => {
