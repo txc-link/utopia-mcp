@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createServer } from './server.js';
 import { ping } from './db.js';
 
@@ -44,23 +45,58 @@ app.use((req: Request, res: Response, next) => {
  */
 const transports = new Map<string, StreamableHTTPServerTransport>();
 
+/**
+ * 会话失效（服务端重启、会话被回收）时的标准应答。
+ *
+ * 规范要求未知/过期 session 返回 **404**，客户端据此重新 initialize。
+ * 反例（不要这么写）：直接放行到一个未初始化的新 transport —— SDK 会抛
+ * `Bad Request: Server not initialized`，且响应体里 `id: null` 无法与请求关联，
+ * 实测 codex-mcp-client 会一直等到超时（默认 300s）而不是报错。
+ */
+function sessionNotFound(res: Response): void {
+  res.status(404).json({
+    jsonrpc: '2.0',
+    error: { code: -32001, message: 'Session not found' },
+    id: null,
+  });
+}
+
 app.post('/mcp', async (req: Request, res: Response) => {
   const sessionId = req.header('mcp-session-id');
-  let transport = sessionId ? transports.get(sessionId) : undefined;
 
-  if (!transport) {
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (sid) => {
-        transports.set(sid, transport as StreamableHTTPServerTransport);
-      },
-    });
-    transport.onclose = () => {
-      const sid = transport?.sessionId;
-      if (sid) transports.delete(sid);
-    };
-    await createServer().connect(transport);
+  // 已有会话：复用。未知会话必须 404，让客户端重新握手。
+  if (sessionId) {
+    const existing = transports.get(sessionId);
+    if (!existing) {
+      console.warn(`utopia-mcp: unknown session ${sessionId} → 404（客户端应重新 initialize）`);
+      sessionNotFound(res);
+      return;
+    }
+    await existing.handleRequest(req, res, req.body);
+    return;
   }
+
+  // 无会话：只有 initialize 能开新会话，其余请求快速失败（错误里带上请求 id，便于客户端关联）。
+  if (!isInitializeRequest(req.body)) {
+    res.status(400).json({
+      jsonrpc: '2.0',
+      error: { code: -32600, message: 'Bad Request: missing Mcp-Session-Id (initialize first)' },
+      id: (req.body as { id?: unknown })?.id ?? null,
+    });
+    return;
+  }
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (sid) => {
+      transports.set(sid, transport);
+    },
+  });
+  transport.onclose = () => {
+    const sid = transport.sessionId;
+    if (sid) transports.delete(sid);
+  };
+  await createServer().connect(transport);
 
   try {
     await transport.handleRequest(req, res, req.body);
@@ -92,7 +128,7 @@ app.get('/mcp', async (req: Request, res: Response) => {
   const sid = req.header('mcp-session-id');
   const transport = sid ? transports.get(sid) : undefined;
   if (!transport) {
-    res.status(400).type('text/plain').send('Invalid or missing session');
+    sessionNotFound(res);
     return;
   }
   await transport.handleRequest(req, res);

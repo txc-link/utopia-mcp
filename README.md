@@ -111,3 +111,13 @@ codex mcp add utopia \
 ```
 
 令牌只需存在于用户级环境变量（不要写进 `config.toml`）。
+
+### 会话语义（改了别踩坑）
+
+`/mcp` 是有状态会话：`initialize` 后服务端下发 `Mcp-Session-Id`，客户端后续请求都要带上。
+会话表在内存里，**容器一重启所有会话就失效**。此时服务端必须返回 `404`（规范要求），
+客户端会自己重新 `initialize`，用户无感。
+
+不要改成"未知 session 就直接放行到一个新 transport"：SDK 会抛
+`Bad Request: Server not initialized`，且响应体 `id: null` 与请求无法关联 ——
+实测 `codex-mcp-client` 不会报错，而是一直挂到 300s 超时。
