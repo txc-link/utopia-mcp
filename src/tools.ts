@@ -17,12 +17,12 @@ const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n
 export async function typeList(input: { parent_type_id?: string }) {
   const rows = input.parent_type_id
     ? await db.query(
-        `select type_id, name, description, parent_type_id, schema_json
+        `select type_id, name, description, parent_type_id, schema_json, status
            from ont_type where parent_type_id = $1 order by type_id`,
         [input.parent_type_id],
       )
     : await db.query(
-        `select type_id, name, description, parent_type_id, schema_json
+        `select type_id, name, description, parent_type_id, schema_json, status
            from ont_type order by coalesce(parent_type_id,''), type_id`,
       );
   return { items: rows.rows, total: rows.rowCount };
