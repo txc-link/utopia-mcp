@@ -1,0 +1,20 @@
+# 部署到服务器：/opt/utopia-mcp/docker-compose.yml
+# 复用 /opt/utopia/.env 中的数据库口令与 MCP 接入令牌
+services:
+  utopia-mcp:
+    build: /opt/utopia-mcp
+    image: utopia-mcp:0.1.0
+    container_name: utopia-mcp
+    restart: unless-stopped
+    env_file:
+      - /opt/utopia/.env
+    environment:
+      PORT: "8080"
+    networks:
+      - utopia_default
+    ports:
+      - "127.0.0.1:18425:8080"
+
+networks:
+  utopia_default:
+    external: true
