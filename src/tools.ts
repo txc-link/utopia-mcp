@@ -1,493 +1,346 @@
-import { db } from './db.js';
-import {
-  EVIDENCE_KINDS,
-  EVIDENCE_RELATIONS,
-  SENSITIVITIES,
-  STATEMENT_STATUSES,
-  type EvidenceKind,
-  type EvidenceRelation,
-  type Sensitivity,
-  type StatementStatus,
-} from './types.js';
+import { api, KB_ID, officialMcp } from './client.js';
+import { EVIDENCE_KINDS, EVIDENCE_RELATIONS, SENSITIVITIES, STATEMENT_STATUSES, type Sensitivity, type StatementStatus } from './types.js';
 
-const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+type EntityType = { id: string; key: string; label: string; description?: string; parents?: string[]; primary_parent?: string | null; usage?: number };
+type RelationType = { id: string; key: string; label: string; description?: string; kind?: string; domains?: string[]; ranges?: string[]; datatype?: string; functional?: boolean; temporal?: string; usage?: number };
+type Ontology = { entity_types: EntityType[]; relation_types: RelationType[] };
+export type PendingCandidate = {
+  id: string;
+  chunk_id?: string;
+  created_at?: string;
+  subject_id?: string;
+  subject_name?: string;
+  proposed_predicate?: string;
+  object_id?: string | null;
+  object_name?: string | null;
+  object_value?: unknown;
+  quote?: string;
+};
 
-// ── 只读：类型 ─────────────────────────────────────────────────────────────
+const kb = (suffix: string) => `/api/v1/kbs/${KB_ID}${suffix}`;
+const ontology = () => api<Ontology>(kb('/ontology'));
+const rowsOf = (value: any): any[] => Array.isArray(value) ? value : value?.items ?? value?.entities ?? [];
+const candidateWaitMs = () => Math.max(5_000, Math.min(Number(process.env.UTOPIA_CANDIDATE_WAIT_MS ?? 90_000), 120_000));
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const subjectAliases = new Map<string, Set<string>>();
+
+function exactEntityName(entity: any): string {
+  return String(entity?.canonical_name ?? entity?.name ?? entity?.label ?? '');
+}
+
+export function officialLiteral(value: unknown): unknown {
+  if (value && typeof value === 'object' && 'value' in value) {
+    return (value as { value: unknown }).value;
+  }
+  return value;
+}
+
+export function findEntityByExactLabel(value: unknown, label: string): any | undefined {
+  const wanted = label.trim().toLocaleLowerCase();
+  return rowsOf(value).find((entity) => exactEntityName(entity).trim().toLocaleLowerCase() === wanted);
+}
+
+export function candidateToStatement(candidate: PendingCandidate, subjectOverride?: string) {
+  return {
+    statement_id: candidate.id,
+    id: candidate.id,
+    chunk_id: candidate.chunk_id,
+    subject_id: subjectOverride ?? candidate.subject_id,
+    official_subject_id: candidate.subject_id,
+    predicate: candidate.proposed_predicate,
+    object_entity_id: candidate.object_id ?? null,
+    object_literal: officialLiteral(candidate.object_value) ?? candidate.object_name ?? null,
+    recorded_at: candidate.created_at,
+    status: 'candidate' as const,
+    quote: candidate.quote,
+    source: 'official-utopia',
+  };
+}
+
+export function selectNewCandidateStatements(
+  value: unknown,
+  beforeIds: ReadonlySet<string>,
+  subjectId: string,
+  objectHint?: unknown,
+  subjectName?: string,
+) {
+  const hint = objectHint === undefined ? '' : String(objectHint).trim().toLocaleLowerCase();
+  const name = subjectName?.trim().toLocaleLowerCase() ?? '';
+  return rowsOf(value)
+    .filter((candidate: PendingCandidate) => {
+      if (beforeIds.has(candidate.id)) return false;
+      return candidate.subject_id === subjectId
+        || (name && String(candidate.quote ?? '').toLocaleLowerCase().includes(name));
+    })
+    .filter((candidate: PendingCandidate) => {
+      if (!hint) return true;
+      const object = String(officialLiteral(candidate.object_value) ?? candidate.object_name ?? '').trim().toLocaleLowerCase();
+      const quote = String(candidate.quote ?? '').toLocaleLowerCase();
+      return object === hint || quote.includes(hint);
+    })
+    .map((candidate: PendingCandidate) => candidateToStatement(candidate, subjectId));
+}
+
+export function selectEntityFromNewCandidates(
+  value: unknown,
+  beforeIds: ReadonlySet<string>,
+  sourceLabel: string,
+): { id: string; name?: string } | undefined {
+  const label = sourceLabel.trim().toLocaleLowerCase();
+  const hit = rowsOf(value).find((candidate: PendingCandidate) => {
+    if (beforeIds.has(candidate.id) || !candidate.subject_id) return false;
+    return String(candidate.quote ?? '').toLocaleLowerCase().includes(label);
+  }) as PendingCandidate | undefined;
+  return hit?.subject_id ? { id: hit.subject_id, name: hit.subject_name } : undefined;
+}
+
+async function pendingQueue(): Promise<any> {
+  return api(kb('/review?queue=pending&limit=200&offset=0'));
+}
+
+async function waitForEntity(label: string, beforeIds: ReadonlySet<string>): Promise<any | undefined> {
+  const deadline = Date.now() + candidateWaitMs();
+  do {
+    const [response, pending] = await Promise.all([
+      api<any>(kb(`/entities?q=${encodeURIComponent(label)}&limit=20`)),
+      pendingQueue(),
+    ]);
+    const found = findEntityByExactLabel(response, label)
+      ?? selectEntityFromNewCandidates(pending, beforeIds, label);
+    if (found) return found;
+    await pause(750);
+  } while (Date.now() < deadline);
+  return undefined;
+}
+
+async function waitForCandidate(beforeIds: ReadonlySet<string>, subjectId: string, objectHint: unknown, subjectName: string) {
+  const deadline = Date.now() + candidateWaitMs();
+  do {
+    const hits = selectNewCandidateStatements(await pendingQueue(), beforeIds, subjectId, objectHint, subjectName);
+    if (hits.length) return hits;
+    await pause(750);
+  } while (Date.now() < deadline);
+  return [];
+}
+
+export function officialResultJson(value: any): any {
+  const text = value?.content?.find?.((item: any) => item?.type === 'text')?.text;
+  if (typeof text !== 'string') return value;
+  try { return JSON.parse(text); } catch { return value; }
+}
+
+async function resolveType(ref: string, graph?: Ontology): Promise<EntityType | undefined> {
+  const o = graph ?? await ontology();
+  return o.entity_types.find((t) => t.id === ref || t.key === ref);
+}
 
 export async function typeList(input: { parent_type_id?: string }) {
-  const rows = input.parent_type_id
-    ? await db.query(
-        `select type_id, name, description, parent_type_id, schema_json, status
-           from ont_type where parent_type_id = $1 order by type_id`,
-        [input.parent_type_id],
-      )
-    : await db.query(
-        `select type_id, name, description, parent_type_id, schema_json, status
-           from ont_type order by coalesce(parent_type_id,''), type_id`,
-      );
-  return { items: rows.rows, total: rows.rowCount };
+  const o = await ontology();
+  let items = o.entity_types;
+  if (input.parent_type_id) {
+    const parent = await resolveType(input.parent_type_id, o);
+    items = parent ? items.filter((t) => t.parents?.includes(parent.id)) : [];
+  }
+  return { items, total: items.length, source: 'official-utopia' };
 }
 
 export async function typeGet(input: { type_id: string }) {
-  const t = await db.query(`select * from ont_type where type_id = $1`, [input.type_id]);
-  if (t.rowCount === 0) return { found: false };
-  const [props, rels] = await Promise.all([
-    db.query(`select * from ont_property where type_id = $1 order by name`, [input.type_id]),
-    db.query(
-      `select * from ont_relation where from_type_id = $1 or to_type_id = $1 order by name`,
-      [input.type_id],
-    ),
-  ]);
-  return { found: true, type: t.rows[0], properties: props.rows, relations: rels.rows };
+  const o = await ontology();
+  const type = await resolveType(input.type_id, o);
+  if (!type) return { found: false };
+  const properties = o.relation_types.filter((r) => r.kind === 'attribute' && r.domains?.includes(type.id));
+  const relations = o.relation_types.filter((r) => r.kind !== 'attribute' && (r.domains?.includes(type.id) || r.ranges?.includes(type.id)));
+  return { found: true, type, properties, relations, source: 'official-utopia' };
 }
 
-// ── 只读：实体 ─────────────────────────────────────────────────────────────
-
-export async function entitySearch(input: {
-  query?: string;
-  type_id?: string;
-  sensitivity?: Sensitivity;
-  limit?: number;
-}) {
-  const params: unknown[] = [];
-  const where: string[] = [];
-  if (input.query) {
-    params.push(`%${input.query}%`);
-    where.push(`(label ilike $${params.length} or entity_id ilike $${params.length})`);
-  }
-  if (input.type_id) {
-    params.push(input.type_id);
-    where.push(`type_id = $${params.length}`);
-  }
-  if (input.sensitivity) {
-    params.push(input.sensitivity);
-    where.push(`sensitivity = $${params.length}`);
-  }
-  params.push(clamp(input.limit ?? 20, 1, 100));
-  const sql = `select entity_id, type_id, label, sensitivity, created_at
-                 from ont_entity
-                ${where.length ? 'where ' + where.join(' and ') : ''}
-                order by entity_id
-                limit $${params.length}`;
-  const r = await db.query(sql, params);
-  return { items: r.rows, total: r.rowCount };
+export async function entitySearch(input: { query?: string; type_id?: string; sensitivity?: Sensitivity; limit?: number }) {
+  const q = encodeURIComponent(input.query ?? '');
+  const limit = Math.max(1, Math.min(input.limit ?? 20, 100));
+  const response = await api<any>(kb(`/entities?q=${q}&limit=${limit}`));
+  let items = rowsOf(response);
+  if (input.type_id) items = items.filter((e) => e.type_id === input.type_id || e.type_key === input.type_id);
+  return { items, total: items.length, source: 'official-utopia', note: input.sensitivity ? '官方实体 API 不使用旧 sensitivity 枚举，已忽略该过滤项。' : undefined };
 }
 
 export async function entityGet(input: { entity_id: string }) {
-  const e = await db.query(`select * from ont_entity where entity_id = $1`, [input.entity_id]);
-  if (e.rowCount === 0) return { found: false };
-  // 只返回已审核且未取代的权威事实（§2.4）
-  const stmts = await db.query(
-    `select statement_id, predicate, object_entity_id, object_literal,
-            valid_from, valid_to, recorded_at, status, sensitivity
-       from ont_statement
-      where subject_id = $1 and status = 'approved' and superseded_at is null
-      order by predicate, recorded_at desc`,
-    [input.entity_id],
-  );
-  return { found: true, entity: e.rows[0], statements: stmts.rows };
+  try {
+    const detail = await api<any>(kb(`/entities/${encodeURIComponent(input.entity_id)}`));
+    return { found: true, ...detail, source: 'official-utopia' };
+  } catch (error) {
+    if (String(error).includes('404')) return { found: false };
+    throw error;
+  }
 }
 
-// ── 只读：事实查询（含双时态语义）─────────────────────────────────────────
-
-export async function statementQuery(input: {
-  subject_id?: string;
-  predicate?: string;
-  status?: StatementStatus;
-  sensitivity?: Sensitivity;
-  as_of?: string;
-  as_recorded?: string;
-  include_superseded?: boolean;
-  limit?: number;
-}) {
-  // as-of：某业务时点成立什么（仅 approved 且未取代）
-  if (input.as_of && input.subject_id) {
-    const r = await db.query(`select * from ont_as_of($1, $2::timestamptz)`, [
-      input.subject_id,
-      input.as_of,
-    ]);
-    return { mode: 'as_of', at: input.as_of, items: r.rows, total: r.rowCount };
+export async function entityUpsert(input: { entity_id: string; type_id: string; label: string; sensitivity?: Sensitivity; properties?: Record<string, unknown> }) {
+  try {
+    await api(kb(`/entities/${encodeURIComponent(input.entity_id)}`), { method: 'PATCH', body: JSON.stringify({ canonical_name: input.label, type_id: input.type_id }) });
+    return { ok: true, was_update: true, entity_id: input.entity_id, source: 'official-utopia' };
+  } catch (error) {
+    if (!String(error).includes('404')) return { ok: false, error: String(error) };
   }
-
-  // as-recorded：某系统时点我们以为什么
-  if (input.as_recorded && input.subject_id) {
-    const r = await db.query(`select * from ont_as_recorded($1, $2::timestamptz)`, [
-      input.subject_id,
-      input.as_recorded,
-    ]);
-    return { mode: 'as_recorded', at: input.as_recorded, items: r.rows, total: r.rowCount };
-  }
-
-  const params: unknown[] = [];
-  const where: string[] = [];
-  if (!input.include_superseded) where.push(`superseded_at is null`);
-  if (input.subject_id) {
-    params.push(input.subject_id);
-    where.push(`subject_id = $${params.length}`);
-  }
-  if (input.predicate) {
-    params.push(input.predicate);
-    where.push(`predicate = $${params.length}`);
-  }
-  if (input.status) {
-    params.push(input.status);
-    where.push(`status = $${params.length}`);
-  } else {
-    where.push(`status = 'approved'`); // 默认只看权威事实
-  }
-  if (input.sensitivity) {
-    params.push(input.sensitivity);
-    where.push(`sensitivity = $${params.length}`);
-  }
-  params.push(clamp(input.limit ?? 20, 1, 200));
-  const r = await db.query(
-    `select * from ont_statement
-      where ${where.join(' and ')}
-      order by recorded_at desc
-      limit $${params.length}`,
-    params,
+  const already = findEntityByExactLabel(
+    await api<any>(kb(`/entities?q=${encodeURIComponent(input.label)}&limit=20`)),
+    input.label,
   );
-  return { mode: 'current', items: r.rows, total: r.rowCount };
+  if (already) {
+    return {
+      ok: true,
+      was_update: false,
+      was_existing: true,
+      entity_id: already.id ?? already.entity_id,
+      requested_external_id: input.entity_id,
+      source: 'official-utopia',
+    };
+  }
+  const type = await resolveType(input.type_id);
+  const props = input.properties && Object.keys(input.properties).length ? ` Properties: ${JSON.stringify(input.properties)}.` : '';
+  const before = await pendingQueue();
+  const beforeIds = new Set(rowsOf(before).map((candidate: PendingCandidate) => candidate.id));
+  const result = await officialMcp('remember', { text: `${input.label} is an entity of type ${type?.label ?? input.type_id}.${props}` });
+  const created = await waitForEntity(input.label, beforeIds);
+  if (!created) {
+    return {
+      ok: false,
+      recorded: true,
+      requested_external_id: input.entity_id,
+      result,
+      error: '内容已记录，但在等待窗口内未取得 Utopia 分配的实体 UUID；不得把外部 UUID 冒充官方实体 ID。',
+    };
+  }
+  return {
+    ok: true,
+    proposed: true,
+    entity_id: created.id ?? created.entity_id,
+    requested_external_id: input.entity_id,
+    result,
+    source: 'official-utopia',
+    note: '内容已进入 Utopia 记忆与审核队列；返回的是抽取后由 Utopia 分配的实体 UUID。',
+  };
 }
 
-// ── 只读：证据与溯源链 ─────────────────────────────────────────────────────
+export async function typeUpsert(input: { type_id: string; name: string; description?: string; parent_type_id?: string; schema_json?: Record<string, unknown>; proposed_by: string; properties?: Array<{ property_id: string; name: string; value_type: 'string'|'number'|'boolean'|'date'|'ref'; cardinality?: '1'|'0..1'|'1..*'|'0..*'; constraints?: Record<string, unknown> }> }) {
+  try {
+    let o = await ontology();
+    const existing = await resolveType(input.type_id, o);
+    const parent = input.parent_type_id ? await resolveType(input.parent_type_id, o) : undefined;
+    const type = existing
+      ? await api<EntityType>(kb(`/ontology/entity-types/${existing.id}`), { method: 'PATCH', body: JSON.stringify({ label: input.name, description: input.description ?? '', parents: parent ? [parent.id] : existing.parents ?? [] }) })
+      : await api<EntityType>(kb('/ontology/entity-types'), { method: 'POST', body: JSON.stringify({ key: input.type_id, label: input.name, description: input.description ?? '', parents: parent ? [parent.id] : [] }) });
+    o = await ontology();
+    const officialType = await resolveType(type.id ?? input.type_id, o) ?? type;
+    const updated: string[] = [];
+    for (const p of input.properties ?? []) {
+      const old = o.relation_types.find((r) => r.kind === 'attribute' && r.key === p.property_id && r.domains?.includes(officialType.id));
+      const datatype = ({ string: 'text', number: 'number', boolean: 'bool', date: 'date', ref: 'text' } as const)[p.value_type];
+      const payload = { label: p.name, kind: 'attribute', domains: [officialType.id], temporal: 'state', functional: p.cardinality === '1' || p.cardinality === '0..1' || !p.cardinality, inverse_functional: false, description: '', datatype, unit: '' };
+      if (old) await api(kb(`/ontology/relation-types/${old.id}`), { method: 'PATCH', body: JSON.stringify(payload) });
+      else await api(kb('/ontology/relation-types'), { method: 'POST', body: JSON.stringify({ key: p.property_id, ...payload }) });
+      updated.push(p.property_id);
+    }
+    return { ok: true, type: officialType, properties_upserted: updated, source: 'official-utopia', requires_review: false, note: '官方 Utopia 的人工/API Schema 编辑保存后立即生效，并进入审计台账。' };
+  } catch (error) { return { ok: false, error: String(error) }; }
+}
+
+export async function typeReview(input: { type_id: string; to_status: StatementStatus; actor: string; note?: string }) {
+  const found = await typeGet({ type_id: input.type_id });
+  if (!found.found) return { ok: false, error: 'type not found' };
+  return { ok: input.to_status === 'approved', type: found.type, requested_status: input.to_status, note: input.to_status === 'approved' ? '官方 Utopia 中由人工/API 创建的 Schema 已生效，无需二次状态流转。' : '官方 Utopia 不支持旧 MCP 的类型状态机；请在 Web 本体工作台修改或删除。' };
+}
+
+export async function statementQuery(input: { subject_id?: string; predicate?: string; status?: StatementStatus; sensitivity?: Sensitivity; as_of?: string; as_recorded?: string; include_superseded?: boolean; limit?: number }) {
+  if (!input.subject_id) return { ok: false, error: '官方 Utopia 事实查询需要 subject_id；先调用 ontology_entity_search。' };
+  if (input.as_recorded) return { ok: false, error: 'as_recorded 请改用官方 changes 工具按记录时间窗口查询。' };
+  const officialIds = [input.subject_id, ...(subjectAliases.get(input.subject_id) ?? [])];
+  const [factResults, pending] = await Promise.all([
+    Promise.all(officialIds.map((entityId) => officialMcp('entity_facts', { entity_id: entityId, ...(input.as_of ? { at: input.as_of.slice(0, 10) } : {}) }))),
+    pendingQueue(),
+  ]);
+  const facts = factResults.flatMap((result) => rowsOf(officialResultJson(result))).map((fact) => ({
+    ...fact,
+    statement_id: fact.statement_id ?? fact.fact_id ?? fact.id,
+    status: fact.status ?? 'approved',
+    source: 'official-utopia',
+  }));
+  const candidates = rowsOf(pending)
+    .filter((candidate: PendingCandidate) => officialIds.includes(candidate.subject_id ?? ''))
+    .map((candidate: PendingCandidate) => candidateToStatement(candidate, input.subject_id));
+  let items = input.status === 'candidate' || input.status === 'under_review'
+    ? candidates
+    : input.status === 'approved'
+      ? facts
+      : [...candidates, ...facts];
+  if (input.predicate) items = items.filter((item) => item.predicate === input.predicate);
+  items = items.slice(0, Math.max(1, Math.min(input.limit ?? 20, 200)));
+  return {
+    ok: true,
+    mode: input.as_of ? 'as_of' : 'history',
+    items,
+    total: items.length,
+    source: 'official-utopia',
+    note: candidates.length ? '结果包含尚未确认的 candidate；只有 approved 事实属于已发布图谱。' : undefined,
+  };
+}
 
 export async function evidenceGet(input: { statement_id?: string; evidence_id?: string }) {
-  if (input.evidence_id) {
-    const e = await db.query(`select * from ont_evidence where evidence_id = $1`, [input.evidence_id]);
-    if (e.rowCount === 0) return { found: false };
-    const links = await db.query(
-      `select statement_id, relation from ont_statement_evidence where evidence_id = $1`,
-      [input.evidence_id],
-    );
-    return { found: true, evidence: e.rows[0], used_by: links.rows };
-  }
-  if (!input.statement_id) return { error: 'statement_id 或 evidence_id 必须提供一个' };
-  const rows = await db.query(
-    `select e.*, se.relation
-       from ont_statement_evidence se
-       join ont_evidence e using (evidence_id)
-      where se.statement_id = $1
-      order by e.recorded_at`,
-    [input.statement_id],
-  );
-  return { statement_id: input.statement_id, chain: rows.rows, total: rows.rowCount };
+  if (input.evidence_id) return { ok: false, error: '官方 API 以 fact_id 查询证据，不支持旧 evidence_id 反查。' };
+  if (!input.statement_id) return { ok: false, error: 'statement_id 必填' };
+  return api(kb(`/facts/${encodeURIComponent(input.statement_id)}/evidence`));
 }
 
-// ── 写：提交 candidate（Agent 入口，§2.6 权限原则）────────────────────────
-
-/**
- * 创建或更新实体实例。
- *
- * 为什么需要它：`ontology_statement_propose` 只能对**已存在**的实体断言事实。
- * 若没有实体创建入口，Agent 就必须绕过 MCP 直接写库，破坏「所有写入都经过
- * 校验与审计」的边界。
- *
- * 更新采用「字段级合并」：只覆盖显式传入的字段，未传字段保持原值；
- * 实体本身不是双时态对象（事实才是），因此允许就地更新，但会记录 updated_at。
- */
-export async function entityUpsert(input: {
-  entity_id: string;
-  type_id: string;
-  label: string;
-  sensitivity?: Sensitivity;
-  properties?: Record<string, unknown>;
-}) {
-  if (!input.entity_id?.trim() || !input.type_id?.trim() || !input.label?.trim()) {
-    return { ok: false, error: 'entity_id / type_id / label 均为必填' };
+export async function statementPropose(input: { subject_id: string; predicate: string; object_entity_id?: string; object_literal?: unknown; object_literal_type?: string; valid_from?: string; valid_to?: string; sensitivity?: Sensitivity; proposed_by: string; source_fingerprint?: string; supersedes_id?: string; evidence?: Array<{ evidence_id: string; kind: string; ref: string; excerpt?: string; relation?: string }> }) {
+  if (!input.object_entity_id && input.object_literal === undefined) return { ok: false, error: 'object_entity_id 与 object_literal 至少提供一个' };
+  const subject = await entityGet({ entity_id: input.subject_id });
+  const subjectName = (subject as any)?.entity?.name ?? (subject as any)?.name ?? input.subject_id;
+  let object = input.object_literal;
+  if (input.object_entity_id) {
+    const target = await entityGet({ entity_id: input.object_entity_id });
+    object = (target as any)?.entity?.name ?? (target as any)?.name ?? input.object_entity_id;
   }
-  try {
-    const r = await db.query(
-      `insert into ont_entity (entity_id, type_id, label, sensitivity, properties)
-       values ($1,$2,$3,$4,$5::jsonb)
-       on conflict (entity_id) do update set
-         type_id     = excluded.type_id,
-         label       = excluded.label,
-         sensitivity = excluded.sensitivity,
-         properties  = ont_entity.properties || excluded.properties
-       returning entity_id, type_id, label, sensitivity, properties, created_at,
-                 (xmax <> 0) as was_update`,
-      [
-        input.entity_id.trim(),
-        input.type_id.trim(),
-        input.label.trim(),
-        input.sensitivity ?? 'team',
-        JSON.stringify(input.properties ?? {}),
-      ],
-    );
-    return { ok: true, entity: r.rows[0] };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes('ont_entity_type_id_fkey')) {
-      return { ok: false, error: `类型不存在: ${input.type_id}（先用 ontology_type_upsert 创建）` };
-    }
-    return { ok: false, error: msg };
-  }
-}
-
-/**
- * 创建或更新本体类型（元模型，高权限）。
- *
- * 这是「Schema 只存在于 Utopia」的写入入口。与事实不同，元模型变更不是
- * 双时态对象，但属于强约束变更，调用方应在 ADR 中留痕。
- */
-export async function typeUpsert(input: {
-  type_id: string;
-  name: string;
-  description?: string;
-  parent_type_id?: string;
-  schema_json?: Record<string, unknown>;
-  proposed_by: string;
-  properties?: Array<{
-    property_id: string;
-    name: string;
-    value_type: 'string' | 'number' | 'boolean' | 'date' | 'ref';
-    cardinality?: '1' | '0..1' | '1..*' | '0..*';
-    constraints?: Record<string, unknown>;
-  }>;
-}) {
-  if (!input.type_id?.trim() || !input.name?.trim()) {
-    return { ok: false, error: 'type_id / name 均为必填' };
-  }
-  const client = await (await import('./db.js')).pool.connect();
-  try {
-    await client.query('begin');
-    const tid = input.type_id.trim();
-
-    // 先取现状，用于判断「内容是否真的变了」——幂等重放不应把已批准类型打回候选
-    const cur = await client.query(`select * from ont_type where type_id = $1`, [tid]);
-    const existing = cur.rows[0] as
-      | { status: string; name: string; description: string | null; parent_type_id: string | null }
-      | undefined;
-    const changed =
-      !existing ||
-      existing.name !== input.name.trim() ||
-      (input.description !== undefined && existing.description !== input.description) ||
-      (existing.parent_type_id ?? null) !== (input.parent_type_id ?? null);
-
-    // 新类型 = candidate；已批准类型若内容有变 = 退回 candidate 重新审批；
-    // 内容未变 = 保持原状态（幂等）；deprecated 不可复活。
-    const nextStatus = !existing
-      ? 'candidate'
-      : existing.status === 'deprecated'
-        ? 'deprecated'
-        : existing.status === 'approved' && (changed || (input.properties?.length ?? 0) > 0)
-          ? 'candidate'
-          : existing.status;
-
-    const t = await client.query(
-      `insert into ont_type (type_id, name, description, parent_type_id, schema_json, status, proposed_by)
-       values ($1,$2,$3,$4,$5::jsonb,'candidate',$6)
-       on conflict (type_id) do update set
-         name           = excluded.name,
-         description    = coalesce(excluded.description, ont_type.description),
-         parent_type_id = excluded.parent_type_id,
-         schema_json    = ont_type.schema_json || excluded.schema_json,
-         status         = $7,
-         proposed_by    = excluded.proposed_by
-       returning *`,
-      [
-        tid,
-        input.name.trim(),
-        input.description ?? null,
-        input.parent_type_id ?? null,
-        JSON.stringify(input.schema_json ?? {}),
-        input.proposed_by,
-        nextStatus,
-      ],
-    );
-    const props: string[] = [];
-    for (const p of input.properties ?? []) {
-      await client.query(
-        `insert into ont_property (property_id, type_id, name, value_type, cardinality, constraints)
-         values ($1,$2,$3,$4,$5,$6::jsonb)
-         on conflict (property_id) do update set
-           name        = excluded.name,
-           value_type  = excluded.value_type,
-           cardinality = excluded.cardinality,
-           constraints = excluded.constraints`,
-        [
-          p.property_id,
-          tid,
-          p.name,
-          p.value_type,
-          p.cardinality ?? '1',
-          JSON.stringify(p.constraints ?? {}),
-        ],
-      );
-      props.push(p.property_id);
-    }
-    await client.query('commit');
-    const row = t.rows[0] as { status: string };
+  const validity = input.valid_to ? ` This held until ${input.valid_to}.` : '';
+  const evidence = input.evidence?.length ? ` Evidence: ${input.evidence.map((e) => `${e.kind}:${e.ref}${e.excerpt ? ` (${e.excerpt})` : ''}`).join('; ')}.` : '';
+  const before = await pendingQueue();
+  const beforeIds = new Set(rowsOf(before).map((candidate: PendingCandidate) => candidate.id));
+  const result = await officialMcp('remember', { text: `${subjectName} ${input.predicate} ${String(object)}.${validity}${evidence}`, ...(input.valid_from ? { occurred_at: input.valid_from.slice(0, 10) } : {}) });
+  const candidates = await waitForCandidate(beforeIds, input.subject_id, object, subjectName);
+  if (!candidates.length) {
     return {
-      ok: true,
-      type: row,
-      properties_upserted: props,
-      requires_review: row.status !== 'approved',
-      note:
-        row.status === 'approved'
-          ? undefined
-          : `类型处于 ${row.status}，实体在被引用前需经 ontology_type_review 审批为 approved`,
+      ok: false,
+      recorded: true,
+      result,
+      error: '内容已记录，但在等待窗口内未取得可寻址 candidate；不得返回无法复核或审批的成功。',
     };
-  } catch (e) {
-    await client.query('rollback');
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  } finally {
-    client.release();
   }
+  for (const candidate of candidates) {
+    const officialId = candidate.official_subject_id;
+    if (!officialId || officialId === input.subject_id) continue;
+    const aliases = subjectAliases.get(input.subject_id) ?? new Set<string>();
+    aliases.add(officialId);
+    subjectAliases.set(input.subject_id, aliases);
+  }
+  return {
+    ok: true,
+    status: 'proposed',
+    statement_id: candidates[0].statement_id,
+    subject_id: input.subject_id,
+    items: candidates,
+    result,
+    source: 'official-utopia',
+    note: '内容已进入 Utopia 审核队列并返回官方 candidate UUID；事实尚未成为已确认本体。',
+  };
 }
 
-/**
- * 类型审批流转（高权限）。
- * 与 statement_review 同构：Agent 可提候选，但批准需人工或高权限调用方。
- */
-export async function typeReview(input: {
-  type_id: string;
-  to_status: StatementStatus;
-  actor: string;
-  note?: string;
-}) {
-  if (!STATEMENT_STATUSES.includes(input.to_status)) {
-    return { ok: false, error: `非法状态: ${input.to_status}` };
+export async function statementReview(input: { statement_id: string; to_status: StatementStatus; actor: string; note?: string }) {
+  if (process.env.UTOPIA_REVIEW_ENABLED !== '1') {
+    return { ok: false, error: '人工审核写入默认关闭；仅服务器显式设置 UTOPIA_REVIEW_ENABLED=1 后才允许 confirm/reject。' };
   }
   try {
-    const r = await db.query(`select * from ont_type_transition($1,$2,$3,$4)`, [
-      input.type_id,
-      input.to_status,
-      input.actor,
-      input.note ?? null,
-    ]);
-    const log = await db.query(
-      `select from_status, to_status, actor, note, at
-         from ont_type_review_log where type_id = $1 order by log_id desc limit 1`,
-      [input.type_id],
-    );
-    return { ok: true, type: r.rows[0], audit: log.rows[0] };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
+    if (input.to_status === 'approved') return { ok: true, result: await api(kb(`/facts/${input.statement_id}/confirm`), { method: 'POST' }) };
+    if (input.to_status === 'rejected') return { ok: true, result: await api(kb(`/facts/${input.statement_id}/reject`), { method: 'POST' }) };
+    return { ok: false, error: `官方 Utopia 不支持旧状态 ${input.to_status} 的直接流转；仅映射 approved→confirm、rejected→reject。` };
+  } catch (error) { return { ok: false, error: String(error) }; }
 }
-
-export async function statementPropose(input: {
-  subject_id: string;
-  predicate: string;
-  object_entity_id?: string;
-  object_literal?: unknown;
-  object_literal_type?: 'string' | 'number' | 'boolean' | 'date';
-  valid_from?: string;
-  valid_to?: string;
-  sensitivity?: Sensitivity;
-  proposed_by: string;
-  source_fingerprint?: string;
-  supersedes_id?: string;
-  evidence?: Array<{ evidence_id: string; kind: EvidenceKind; ref: string; excerpt?: string; relation?: EvidenceRelation }>;
-}) {
-  if (!input.object_entity_id && input.object_literal === undefined) {
-    return { ok: false, error: 'object_entity_id 与 object_literal 至少提供一个' };
-  }
-  const client = await (await import('./db.js')).pool.connect();
-  try {
-    await client.query('begin');
-    const ins = await client.query(
-      `insert into ont_statement
-         (subject_id, predicate, object_entity_id, object_literal, object_literal_type,
-          valid_from, valid_to, sensitivity, proposed_by, source_fingerprint, supersedes_id)
-       values ($1,$2,$3,$4,$5,$6::timestamptz,$7::timestamptz,$8,$9,$10,$11)
-       returning statement_id, status, recorded_at`,
-      [
-        input.subject_id,
-        input.predicate,
-        input.object_entity_id ?? null,
-        input.object_literal === undefined ? null : JSON.stringify(input.object_literal),
-        input.object_literal_type ?? null,
-        input.valid_from ?? null,
-        input.valid_to ?? null,
-        input.sensitivity ?? 'team',
-        input.proposed_by,
-        input.source_fingerprint ?? null,
-        input.supersedes_id ?? null,
-      ],
-    );
-    const statementId = ins.rows[0].statement_id as string;
-
-    const linked: string[] = [];
-    for (const ev of input.evidence ?? []) {
-      await client.query(
-        `insert into ont_evidence (evidence_id, kind, ref, excerpt)
-         values ($1,$2,$3,$4)
-         on conflict (evidence_id) do update set ref = excluded.ref,
-                                                 excerpt = coalesce(excluded.excerpt, ont_evidence.excerpt)`,
-        [ev.evidence_id, ev.kind, ev.ref, ev.excerpt ?? null],
-      );
-      await client.query(
-        `insert into ont_statement_evidence (statement_id, evidence_id, relation)
-         values ($1,$2,$3) on conflict do nothing`,
-        [statementId, ev.evidence_id, ev.relation ?? 'supports'],
-      );
-      linked.push(ev.evidence_id);
-    }
-    await client.query('commit');
-    return {
-      ok: true,
-      statement_id: statementId,
-      status: 'candidate',
-      recorded_at: ins.rows[0].recorded_at,
-      evidence_linked: linked,
-      note: 'candidate 不参与推理与对外服务；需经 ontology_statement_review 审批为 approved 后才生效',
-    };
-  } catch (e) {
-    await client.query('rollback');
-    // 幂等去重（§5.5）：唯一索引冲突给出明确提示
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes('uniq_stmt_fingerprint')) {
-      return { ok: false, error: 'duplicate', detail: '同一 source_fingerprint 已存在未取代的断言（幂等去重）' };
-    }
-    return { ok: false, error: msg };
-  } finally {
-    client.release();
-  }
-}
-
-// ── 写：审批流转（高权限，§2.6）──────────────────────────────────────────
-
-export async function statementReview(input: {
-  statement_id: string;
-  to_status: StatementStatus;
-  actor: string;
-  note?: string;
-}) {
-  if (!STATEMENT_STATUSES.includes(input.to_status)) {
-    return { ok: false, error: `非法状态: ${input.to_status}` };
-  }
-  try {
-    // 注意：不要写成 `select (ont_transition(...)).*` —— 展开复合类型时
-    // PostgreSQL 可能对函数多次求值。第一次调用会改状态，第二次便读到新状态
-    // 而抛出"非法流转"，最终整个语句回滚，表现为"每次都报错但库没变"。
-    // 用 FROM 形式可保证函数只执行一次。
-    const r = await db.query(`select * from ont_transition($1::bigint,$2,$3,$4)`, [
-      input.statement_id,
-      input.to_status,
-      input.actor,
-      input.note ?? null,
-    ]);
-    const log = await db.query(
-      `select from_status, to_status, actor, note, at
-         from ont_review_log where statement_id = $1 order by log_id desc limit 1`,
-      [input.statement_id],
-    );
-    return { ok: true, statement: r.rows[0], audit: log.rows[0] };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
-}
-
-// ── 元数据（供 MCP 自检）──────────────────────────────────────────────────
 
 export function vocabulary() {
-  return {
-    statement_statuses: STATEMENT_STATUSES,
-    sensitivities: SENSITIVITIES,
-    evidence_kinds: EVIDENCE_KINDS,
-    evidence_relations: EVIDENCE_RELATIONS,
-  };
+  return { statement_statuses: STATEMENT_STATUSES, sensitivities: SENSITIVITIES, evidence_kinds: EVIDENCE_KINDS, evidence_relations: EVIDENCE_RELATIONS, official_fact_actions: ['confirm', 'reject'], official_mcp_tools: ['search_chunks', 'get_document', 'search_docs', 'find_entities', 'entity_facts', 'changes', 'remember'] };
 }

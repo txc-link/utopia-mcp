@@ -3,15 +3,12 @@ import express, { type Request, type Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createServer } from './server.js';
-import { ping } from './db.js';
+import { assertOfficialConfig, health } from './client.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
 const TOKEN = process.env.UTOPIA_TOKEN ?? '';
 
-if (!process.env.UTOPIA_DB_URL) {
-  console.error('utopia-mcp: UTOPIA_DB_URL is not set');
-  process.exit(1);
-}
+try { assertOfficialConfig(); } catch (error) { console.error(String(error)); process.exit(1); }
 if (!TOKEN) {
   console.error('utopia-mcp: UTOPIA_TOKEN is not set（拒绝以无鉴权方式启动）');
   process.exit(1);
@@ -22,8 +19,12 @@ app.use(express.json({ limit: '4mb' }));
 
 /** 健康检查：不鉴权，供容器/网关探活。 */
 app.get('/health', async (_req: Request, res: Response) => {
-  const db = await ping();
-  res.status(db.ok ? 200 : 503).json({ status: db.ok ? 'ok' : 'degraded', db });
+  try {
+    const upstream = await health();
+    res.status(200).json({ status: 'ok', backend: 'official-utopia', upstream });
+  } catch (error) {
+    res.status(503).json({ status: 'degraded', backend: 'official-utopia', error: String(error) });
+  }
 });
 
 /** 鉴权：除 /health 外一律要求 Bearer。 */
@@ -135,7 +136,7 @@ app.get('/mcp', async (req: Request, res: Response) => {
 });
 
 const httpServer = app.listen(PORT, () => {
-  console.log(`utopia-mcp ${PORT} listening (auth required, db-backed)`);
+  console.log(`utopia-mcp-adapter ${PORT} listening (auth required, official-api-backed)`);
 });
 
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
