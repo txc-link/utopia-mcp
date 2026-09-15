@@ -1,22 +1,21 @@
-# 部署到服务器：/opt/utopia-mcp/docker-compose.yml
-# 复用 /opt/utopia/.env 中的数据库口令与 MCP 接入令牌
 services:
   utopia-mcp:
     build: /opt/utopia-mcp
-    image: utopia-mcp:0.1.0
+    image: utopia-mcp:0.3.0
     container_name: utopia-mcp
     restart: unless-stopped
     env_file:
-      - /opt/utopia/.env
+      - /opt/utopia-mcp/adapter.env
     environment:
       PORT: "8080"
-    networks:
-      - utopia_default
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      # 内部端口；对外由 Caddy 在 18425 提供 TLS 反代
-      # 公网入口：https://sleepnow.top:18425/mcp
-      - "127.0.0.1:18426:8080"
+      - "127.0.0.1:18426:8080"     # 内部端口；对外由 Caddy 在 18425 提供 TLS
+    networks:
+      - default
+      - tdai-memory-stack
 
 networks:
-  utopia_default:
+  tdai-memory-stack:
     external: true

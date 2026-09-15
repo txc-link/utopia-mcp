@@ -22,8 +22,9 @@ import {
   errorResult,
   jsonResult,
 } from './types.js';
+import { officialMcp } from './client.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.3.0';
 
 /**
  * Utopia MCP Server —— 本体系统唯一真源（ADR-0001 v1.0 §2.6）
@@ -32,7 +33,18 @@ const VERSION = '0.1.0';
  * review 工具属于高权限，应由外层鉴权或人工调用。
  */
 export function createServer(): McpServer {
-  const server = new McpServer({ name: 'utopia', version: VERSION });
+  const server = new McpServer({ name: 'utopia-official-adapter', version: VERSION });
+
+  const passthrough = (name: string, description: string, inputSchema: Record<string, z.ZodTypeAny>) => {
+    server.registerTool(name, { description, inputSchema }, async (args) => officialMcp(name, args));
+  };
+  passthrough('search_chunks', '官方 Utopia：搜索知识库文档片段。', { query: z.string() });
+  passthrough('get_document', '官方 Utopia：读取完整文档。', { document_id: z.string() });
+  passthrough('search_docs', '官方 Utopia：搜索产品手册。', { query: z.string() });
+  passthrough('find_entities', '官方 Utopia：按名称查找实体。', { name: z.string() });
+  passthrough('entity_facts', '官方 Utopia：读取实体双时态事实。', { entity_id: z.string(), at: z.string().optional() });
+  passthrough('changes', '官方 Utopia：按记录时间查询知识变化。', { since: z.string(), until: z.string().optional(), entity_id: z.string().optional(), kinds: z.array(z.enum(['asserted', 'corrected', 'rejected', 'merged'])).optional() });
+  passthrough('remember', '官方 Utopia：记录一条待审核记忆提案。', { text: z.string(), occurred_at: z.string().optional() });
 
   // ── 只读：类型 ───────────────────────────────────────────────────────────
 

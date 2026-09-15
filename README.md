@@ -1,123 +1,37 @@
-# utopia-mcp
+# utopia-mcp-adapter
 
-Utopia —— 本体系统唯一真源的 MCP 服务器。
-
-实现依据：**本体系统架构 ADR v1.0**（TDAI Team Wiki `wiki-ar156gei` → `ADR-0001-本体系统架构-v1.0.md`，需团队凭据访问）。
-
-核心约定速览：
-
-- 唯一真源：本体 Schema 只存在于 Utopia
-- 只 append：修正以「写入新断言 + 标记 `superseded_at`」实现，历史永不删除
-- 只有 `approved` 参与推理与对外服务
-- Agent 只能 `propose`，不能自行 `approve`
-- 执行结果不能自我认证为权威事实
-
-## 定位
-
-四层架构中的**知识真源层**：
-
-| 层 | 职责 |
-| --- | --- |
-| **Utopia** | 本体类型/属性/关系、经审核的权威事实、双时态、证据、推理（**本仓库**） |
-| Agora | Action 执行与多 Agent 编排 |
-| TDAI | 跨工具对话记忆与偏好 |
-| Project Brain | 人类说明、ADR、操作手册、Utopia 只读导出快照 |
-
-## 核心不变量
-
-1. **单一真源** —— Schema 只存在于 Utopia
-2. **只 append，永不 UPDATE** —— 修正以写入新断言 + 标记 `superseded_at` 实现
-3. **只有 `approved` 参与推理与对外服务**
-4. **Agent 只能 propose，不能自行 approve**（§2.6 权限原则）
-5. **执行结果不能自我认证为权威事实** —— Action 回写只写 evidence 与 candidate
+官方 Utopia 的 MCP 兼容适配层。它不保存本体数据，也不直接连接 PostgreSQL；所有查询和写入都通过官方 Utopia REST API 或其内置 MCP 完成。生产部署仍以官方 Utopia 为唯一事实与审核权威。
 
 ## 工具
 
-### 只读
+适配器同时暴露：
 
-| 工具 | 用途 |
+- 官方工具：`search_chunks`、`get_document`、`search_docs`、`find_entities`、`entity_facts`、`changes`、`remember`
+- 旧兼容工具：`ontology_type_list/get/upsert/review`、`ontology_entity_search/get/upsert`、`ontology_statement_query/propose/review`、`ontology_evidence_get`、`ontology_vocabulary`
+
+## 写入语义
+
+| 旧工具 | 官方 Utopia 映射 |
 | --- | --- |
-| `ontology_type_list` / `ontology_type_get` | 查类型定义 |
-| `ontology_entity_search` / `ontology_entity_get` | 查实体 |
-| `ontology_statement_query` | 查事实（支持 `as_of` / `as_recorded` 双时态语义） |
-| `ontology_evidence_get` | 查证据与溯源链 |
-| `ontology_vocabulary` | 读受控词表 |
+| `ontology_type_upsert` | 官方本体工作台 REST API；Schema 保存后立即生效并进入官方审计台账 |
+| `ontology_entity_upsert` 更新已有实体 | 官方实体 `PATCH` API |
+| `ontology_entity_upsert` 创建实体 | 官方 `remember`，等待抽取后返回 Utopia 分配的实体 UUID；超时则失败关闭 |
+| `ontology_statement_propose` | 官方 `remember`，等待并返回官方 candidate UUID；超时则失败关闭 |
+| `ontology_statement_review(...approved)` | 官方 `confirm` |
+| `ontology_statement_review(...rejected)` | 官方 `reject` |
 
-### 写
+`ontology_statement_query` 会合并官方已确认事实与待审 candidate，并明确标记状态；只有 `approved` 属于已发布图谱。官方 v0.1 API 不支持旧系统的任意实体 ID、类型状态机、`evidence_id` 反查或精确 `as_recorded` 接口。适配器会返回明确说明，不会偷偷恢复第二套数据库。
 
-| 工具 | 用途 |
-| --- | --- |
-| `ontology_statement_propose` | 提交 candidate（Agent 入口） |
-| `ontology_statement_review` | 审批流转（**高权限**） |
+兼容调用使用临时主体 ID 发起 `ontology_statement_propose` 时，响应会同时返回稳定的 `official_subject_id`。临时 ID 到官方 ID 的别名只保存在当前适配器进程中；跨重启调用应保存并改用 `official_subject_id`。
 
-## 状态机
+## 环境变量
 
-```
-candidate ──▶ under_review ──▶ approved ──▶ deprecated
-     │              │
-     └──────────────┴──▶ rejected ──▶ candidate
-```
+- `UTOPIA_TOKEN`：调用适配器的外部 Bearer Token
+- `UTOPIA_API_BASE`：官方 Utopia 地址，例如 `http://host.docker.internal:1516`
+- `UTOPIA_KB_ID`：唯一权威知识库 ID
+- `UTOPIA_API_EMAIL` / `UTOPIA_API_PASSWORD`：REST API 服务身份；只保存在服务器权限为 600 的环境文件中
+- `UTOPIA_PAT`：绑定该知识库的官方写入 PAT；只用于官方 MCP
+- `UTOPIA_CANDIDATE_WAIT_MS`：等待官方实体/candidate 可寻址的窗口，默认 90000，范围 5000–120000 毫秒
+- `UTOPIA_REVIEW_ENABLED=1`：显式开启高权限 confirm/reject；默认关闭，避免普通 MCP token 越过人工审核边界
 
-非法流转被 `ont_transition()` 拒绝；所有流转写入 `ont_review_log`（绕过函数直接 UPDATE 也有触发器兜底）。
-
-## 双时态
-
-| 维度 | 字段 |
-| --- | --- |
-| 业务时间 | `valid_from` / `valid_to` |
-| 系统时间 | `recorded_at` / `superseded_at` |
-
-- `ont_as_of(subject, t)` —— 某业务时点成立什么
-- `ont_as_recorded(subject, t)` —— 某系统时点我们以为什么
-
-## 运行
-
-```bash
-pnpm install
-pnpm run build
-UTOPIA_DB_URL=postgresql://...  UTOPIA_TOKEN=...  node dist/index.js
-```
-
-服务暴露 `GET /health`（免鉴权）与 `POST /mcp`（需 `Authorization: Bearer $UTOPIA_TOKEN`）。
-
-## 部署
-
-见 `deploy/docker-compose.yml`。生产部署复用 `/opt/utopia/.env`，容器加入 `utopia_default` 网络，仅监听 `127.0.0.1:18426`，对外由 Caddy 提供 TLS 反代。
-
-### 上线拓扑
-
-```
-Codex / 客户端
-   │  https://sleepnow.top:18425/mcp  (Authorization: Bearer $UTOPIA_TOKEN)
-   ▼
-frps (公网 VPS)  ──frpc──▶  服务器 127.0.0.1:18425 (Caddy, TLS)
-                                    │
-                                    ▼
-                            127.0.0.1:18426 (utopia-mcp)
-                                    │
-                                    ▼
-                            utopia-postgres:5432
-```
-
-- 鉴权由 `utopia-mcp` 自身完成（Bearer token）；Caddy 只做 TLS 终结与转发，不复制凭据。
-- `GET /health` 免鉴权，供网关与容器探活。
-
-### Codex 接入
-
-```bash
-codex mcp add utopia \
-  --url "https://sleepnow.top:18425/mcp" \
-  --bearer-token-env-var UTOPIA_TOKEN
-```
-
-令牌只需存在于用户级环境变量（不要写进 `config.toml`）。
-
-### 会话语义（改了别踩坑）
-
-`/mcp` 是有状态会话：`initialize` 后服务端下发 `Mcp-Session-Id`，客户端后续请求都要带上。
-会话表在内存里，**容器一重启所有会话就失效**。此时服务端必须返回 `404`（规范要求），
-客户端会自己重新 `initialize`，用户无感。
-
-不要改成"未知 session 就直接放行到一个新 transport"：SDK 会抛
-`Bad Request: Server not initialized`，且响应体 `id: null` 与请求无法关联 ——
-实测 `codex-mcp-client` 不会报错，而是一直挂到 300s 超时。
+服务提供免鉴权的 `GET /health` 与需要外部 Bearer Token 的 `POST /mcp`。
